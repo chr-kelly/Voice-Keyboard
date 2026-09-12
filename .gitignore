@@ -1,0 +1,13 @@
+/target/
+/macos/.build/
+/macos/Generated/
+/build/
+.DS_Store
+*.xcuserstate
+*.db
+*.db-shm
+*.db-wal
+.env
+*.p12
+*.pem
+*.key
