@@ -1,0 +1,56 @@
+name: CI
+on:
+  push:
+    branches: [main, 'feat/**']
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  rust:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Toolchain
+        run: rustup toolchain install stable --profile minimal --component clippy --component rustfmt
+      - name: Core and adversarial tests
+        run: cargo test --workspace --all-targets
+      - name: Static analysis
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Dependency lockfile
+        uses: actions/upload-artifact@v4
+        with:
+          name: dependency-lockfile
+          path: Cargo.lock
+  macos:
+    runs-on: macos-26
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Check SDK and toolchain
+        run: |
+          xcodebuild -version
+          xcrun --sdk macosx --show-sdk-version
+          rustup toolchain install stable --profile minimal
+      - name: Build native app and run platform policy tests
+        run: |
+          if [ -f scripts/build-macos.sh ]; then
+            bash scripts/build-macos.sh
+            swift test --package-path macos
+          else
+            cargo test --workspace
+          fi
+      - name: Package unsigned developer build
+        if: hashFiles('scripts/build-macos.sh') != ''
+        run: ditto -c -k --sequesterRsrc --keepParent build/VoiceKeyboard.app build/VoiceKeyboard-macos.zip
+      - uses: actions/upload-artifact@v4
+        if: hashFiles('scripts/build-macos.sh') != ''
+        with:
+          name: VoiceKeyboard-macos-development
+          path: build/VoiceKeyboard-macos.zip

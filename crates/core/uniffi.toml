@@ -1,0 +1,4 @@
+[bindings.swift]
+module_name = "VoiceKeyboardCore"
+ffi_module_name = "VoiceKeyboardCoreFFI"
+generate_module_map = true
