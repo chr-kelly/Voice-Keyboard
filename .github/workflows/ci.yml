@@ -11,46 +11,44 @@ concurrency:
   cancel-in-progress: true
 jobs:
   rust:
+    name: Rust core - tests and Clippy
     runs-on: ubuntu-24.04
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
       - name: Toolchain
         run: rustup toolchain install stable --profile minimal --component clippy --component rustfmt
-      - name: Core and adversarial tests
+      - name: Core unit and adversarial scenario tests
         run: cargo test --workspace --all-targets
       - name: Static analysis
         run: cargo clippy --workspace --all-targets -- -D warnings
-      - name: Dependency lockfile
+      - name: Preserve exact dependency resolution for this run
         uses: actions/upload-artifact@v4
         with:
           name: dependency-lockfile
           path: Cargo.lock
+      - name: State the validation boundary
+        run: |
+          echo '## Rust core only' >> "$GITHUB_STEP_SUMMARY"
+          echo 'These checks do not validate Swift platform APIs, microphones, Doubao, target application input or hardware latency.' >> "$GITHUB_STEP_SUMMARY"
   macos:
+    name: Rust core on macOS 26 - NOT a native app build
     runs-on: macos-26
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
-      - name: Check SDK and toolchain
+      - name: Report environment
         run: |
           xcodebuild -version
           xcrun --sdk macosx --show-sdk-version
           rustup toolchain install stable --profile minimal
-      - name: Build native app and run platform policy tests
+      - name: Compile and test Rust core on macOS
+        run: cargo test --workspace --all-targets
+      - name: State the validation boundary
         run: |
-          if [ -f scripts/build-macos.sh ]; then
-            bash scripts/build-macos.sh
-            swift test --package-path macos
-          else
-            cargo test --workspace
-          fi
-      - name: Package unsigned developer build
-        if: hashFiles('scripts/build-macos.sh') != ''
-        run: ditto -c -k --sequesterRsrc --keepParent build/VoiceKeyboard.app build/VoiceKeyboard-macos.zip
-      - uses: actions/upload-artifact@v4
-        if: hashFiles('scripts/build-macos.sh') != ''
-        with:
-          name: VoiceKeyboard-macos-development
-          path: build/VoiceKeyboard-macos.zip
+          echo '## macOS runner: Rust core only' >> "$GITHUB_STEP_SUMMARY"
+          echo 'No native Swift client is present in this revision. No app bundle was built or tested. Two-Mac and Doubao acceptance gates remain unverified.' >> "$GITHUB_STEP_SUMMARY"
