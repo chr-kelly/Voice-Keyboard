@@ -6,6 +6,8 @@ use sha2::{Digest, Sha256};
 use uuid::Uuid;
 use crate::{err, fail, Result, journal::Journal, protocol::*, stable::StableText, transport::{Channel, ChannelEvent, Identity}};
 
+const MAX_SESSION_TEXT: usize = 256 * 1024;
+
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Trust { pub peer_id: String, pub name: String, pub allow_remote: bool }
@@ -36,13 +38,17 @@ struct Session {
 }
 impl Session {
     fn new(binding: Binding) -> Self {
-        let now = Instant::now(); Self { binding, phase: Phase::Preparing, chunks: BTreeMap::new(), draft: String::new(), stable: StableText::default(), next_send: 1, next_receive: 1, inflight: None, last_sequence: None, retry_allowed: HashSet::new(), started: now, lease: now, keepalive_sent: now, finalizing: None, held: true, stopped: false, stop_requested: false, cancelled: false, frozen: false }
+        let now = Instant::now();
+        Self { binding, phase: Phase::Preparing, chunks: BTreeMap::new(), draft: String::new(), stable: StableText::default(), next_send: 1, next_receive: 1, inflight: None, last_sequence: None, retry_allowed: HashSet::new(), started: now, lease: now, keepalive_sent: now, finalizing: None, held: true, stopped: false, stop_requested: false, cancelled: false, frozen: false }
     }
     fn other(&self, local: &str) -> String {
         if self.binding.source_device_id == local { self.binding.target_device_id.clone() } else { self.binding.source_device_id.clone() }
     }
-    fn can_inject(&self) -> bool { !self.cancelled && !matches!(self.phase, Phase::Preparing | Phase::Paused | Phase::Unknown | Phase::Cancelled | Phase::Done | Phase::StopFailed) }
+    fn can_inject(&self) -> bool {
+        !self.cancelled && !matches!(self.phase, Phase::Preparing | Phase::Paused | Phase::Unknown | Phase::Cancelled | Phase::Done | Phase::StopFailed)
+    }
     fn has_unknown(&self) -> bool { self.chunks.values().any(|c| c.status == Ack::Unknown) }
+    fn text_bytes(&self) -> usize { self.chunks.values().map(|c| c.text.len()).sum() }
 }
 
 pub struct Engine {
@@ -53,9 +59,10 @@ pub struct Engine {
 }
 impl Engine {
     pub fn new(config: Config) -> Result<Self> {
-        if config.name.is_empty() || config.name.len() > 128 || !(1500..=15_000).contains(&config.lease_ms)
-            || !(1000..=60_000).contains(&config.finalizing_ms) || !(10_000..=600_000).contains(&config.max_session_ms)
-            || config.peers.len() > 100 || config.peers.iter().any(|p| !valid_id(&p.peer_id)) { return fail("invalid_configuration"); }
+        if config.name.is_empty() || config.name.len() > 128 || config.name.chars().any(char::is_control)
+            || !(1500..=15_000).contains(&config.lease_ms) || !(1000..=60_000).contains(&config.finalizing_ms)
+            || !(10_000..=600_000).contains(&config.max_session_ms) || config.peers.len() > 100
+            || config.peers.iter().any(|p| !valid_id(&p.peer_id) || p.name.len() > 128) { return fail("invalid_configuration"); }
         let id = config.identity.id()?; let private = config.identity.private_bytes()?;
         let journal = Journal::open(&config.journal_path, &private, now_ms())?;
         Ok(Self { id, private, journal, name: config.name, channels: HashMap::new(), trust: config.peers.into_iter().map(|p| (p.peer_id.clone(), p)).collect(), sessions: HashMap::new(), active_source: None, active_target: None, seen: VecDeque::new(), events: VecDeque::new(), faulted: false, lease: Duration::from_millis(config.lease_ms), finalizing: Duration::from_millis(config.finalizing_ms), max_session: Duration::from_millis(config.max_session_ms), heartbeat: Instant::now() })
@@ -108,6 +115,7 @@ impl Engine {
     fn maybe_pair(&mut self, peer: &str) -> Result<()> {
         let connection = self.connection(peer)?; let c = &self.channels[&connection];
         if c.local_confirmed && c.remote_confirmed {
+            if self.trust.len() >= 100 && !self.trust.contains_key(peer) { return fail("trust_capacity"); }
             self.trust.entry(peer.into()).or_insert(Trust { peer_id: peer.into(), name: c.name.clone(), allow_remote: false });
             self.save_trust(); self.peer_event(peer, true);
         }
@@ -120,7 +128,7 @@ impl Engine {
                 ChannelEvent::Authenticated { peer, code } => {
                     if peer == self.id || self.channels.iter().any(|(id,c)| id != connection && c.peer.as_deref() == Some(&peer)) { return fail("duplicate_connection"); }
                     self.send_on(connection, Payload::Hello { device_id: self.id.clone(), name: self.name.clone() })?;
-                    self.emit(json!({"event":"secure_channel","peer_id":peer,"code":code}));
+                    self.emit(json!({"event":"secure_channel","connection_id":connection,"peer_id":peer,"code":code}));
                 }
                 ChannelEvent::Plain(bytes) => {
                     let wire = Wire::decode(&bytes)?;
@@ -190,8 +198,7 @@ impl Engine {
     }
     fn freeze(&mut self, s: &mut Session, text: String, is_final: bool) -> Result<()> {
         validate_text(&text)?;
-        if s.cancelled || s.binding.source_device_id != self.id || s.next_send > 4096
-            || s.chunks.values().map(|c| c.text.len()).sum::<usize>() + text.len() > 256 * 1024 { return fail("session_text_limit"); }
+        if s.cancelled || s.binding.source_device_id != self.id || s.next_send > 4096 || s.text_bytes() + text.len() > MAX_SESSION_TEXT { return fail("session_text_limit"); }
         let seq = s.next_send; s.next_send += 1;
         let message = Payload::TextChunk { session_id:s.binding.session_id, sequence:seq, context_token:s.binding.context_token.clone(), text:text.clone(), is_final };
         let status = if self.send(&s.binding.target_device_id,message).is_ok() { Ack::Received } else { Ack::NotApplied };
@@ -250,7 +257,11 @@ impl Engine {
                     if s.binding.source_device_id != peer { return fail("session_conflict"); }
                     return Ok(());
                 }
-                let id = self.add_session(b,false)?;
+                let id = b.session_id;
+                if self.add_session(b,false).is_err() {
+                    self.send(peer,Payload::Error {session_id:Some(id),code:"busy_or_expired_session".into()})?;
+                    return Ok(());
+                }
                 self.emit(json!({"event":"bind_target","session_id":id}));
             }
             Payload::SessionBound { binding:b } => {
@@ -271,7 +282,11 @@ impl Engine {
                     if s.binding.controller_device_id != peer || s.binding.context_token != b.context_token || s.binding.input_mode != b.input_mode { return fail("session_conflict"); }
                     let phase = s.phase; self.send(peer,Payload::SessionState { session_id:b.session_id,phase })?; return Ok(());
                 }
-                let id = match self.add_session(b,true) { Ok(id) => id, Err(_) => { self.send(peer,Payload::Error {session_id:None,code:"busy_or_expired_session".into()})?; return Ok(()); } };
+                let id = b.session_id;
+                if self.add_session(b,true).is_err() {
+                    self.send(peer,Payload::Error {session_id:Some(id),code:"busy_or_expired_session".into()})?;
+                    return Ok(());
+                }
                 let b = self.sessions[&id].binding.clone(); self.emit(json!({"event":"prepare_input","binding":b}));
             }
             Payload::ChunkQuery { session_id,sequence } => {
@@ -326,19 +341,27 @@ impl Engine {
                                 }
                                 core.journal.record(id,sequence,Ack::Received)?;
                             }
-                            let safe = context_token == s.binding.context_token && s.can_inject() && sequence >= s.next_receive
-                                && sequence < s.next_receive + MAX_QUEUE as u64 && s.chunks.values().map(|c| c.text.len()).sum::<usize>() + text.len() <= 256*1024;
+                            let old_size = s.chunks.get(&sequence).map_or(0,|c| c.text.len());
+                            let within_budget = s.text_bytes().saturating_sub(old_size) + text.len() <= MAX_SESSION_TEXT;
+                            let within_window = sequence >= s.next_receive && sequence < s.next_receive + MAX_QUEUE as u64;
+                            let safe = context_token == s.binding.context_token && s.can_inject() && within_window && within_budget;
                             let status = if safe { Ack::Received } else { Ack::NotApplied };
                             if status == Ack::NotApplied { core.journal.record(id,sequence,status)?; }
-                            if s.chunks.len() < 4096 { s.chunks.insert(sequence,Chunk { text,status,is_final }); }
+                            // Rejected traffic must not defeat the recovery-memory or reorder bounds.
+                            // Its digest/status is still queryable; the source keeps the text in memory.
+                            if within_budget && within_window && s.chunks.len() < 4096 {
+                                s.chunks.insert(sequence,Chunk { text,status,is_final });
+                            }
                             core.send(peer,Payload::ChunkAck {session_id:id,sequence,ack_status:status})?;
                             core.snapshot(s); core.pump(s);
                         }
                         Payload::ChunkAck {sequence,ack_status,..} => {
                             if peer != s.binding.target_device_id { return fail("unauthorized_ack"); }
                             let c = s.chunks.get_mut(&sequence).ok_or_else(|| err("unknown_chunk"))?;
-                            // Delayed transport ACKs must not downgrade confirmed or unknown outcomes.
-                            if ack_status != Ack::Received || c.status == Ack::Received { if c.status != Ack::Applied { c.status = ack_status; } }
+                            // Transport receipts cannot downgrade applied or unknown outcomes.
+                            if (ack_status != Ack::Received || c.status == Ack::Received) && c.status != Ack::Applied {
+                                c.status = ack_status;
+                            }
                             if !s.cancelled {
                                 if c.status == Ack::Unknown { s.phase = Phase::Unknown; core.request_stop(s); }
                                 else if c.status == Ack::NotApplied { s.phase = Phase::Paused; core.request_stop(s); }
@@ -348,13 +371,15 @@ impl Engine {
                         }
                         Payload::SessionEnd {last_sequence,..} => {
                             if peer != s.binding.source_device_id || last_sequence > 4096 || s.chunks.keys().any(|n| *n > last_sequence) { return fail("invalid_session_end"); }
+                            if s.last_sequence.is_some_and(|n| n != last_sequence) { return fail("conflicting_session_end"); }
                             s.last_sequence = Some(last_sequence); core.finish_receiver(s); core.snapshot(s);
                         }
                         Payload::SessionPause {..} => {
+                            if s.phase.terminal() { return Ok(()); }
                             s.phase = Phase::Paused; if s.binding.source_device_id == core.id { core.request_stop(s); } else { core.pause_receiver(s)?; } core.snapshot(s);
                         }
                         Payload::SessionResume {context_token,target_app,..} => {
-                            if peer != s.binding.target_device_id || !valid_context(&context_token) || s.cancelled || s.has_unknown() { return fail("unsafe_resume"); }
+                            if peer != s.binding.target_device_id || !valid_context(&context_token) || target_app.len() > 256 || s.cancelled || s.has_unknown() { return fail("unsafe_resume"); }
                             s.binding.context_token = context_token; s.binding.target_app = target_app; s.phase = Phase::Committing;
                             let pending: Vec<_> = s.chunks.iter().filter(|(_,c)| c.status == Ack::NotApplied).map(|(&n,c)| (n,c.text.clone(),c.is_final)).collect();
                             for (sequence,text,is_final) in pending {
@@ -433,7 +458,8 @@ impl Engine {
                         "bound" => {
                             if source || s.phase != Phase::Preparing { return fail("invalid_state"); }
                             let token = string(&v,"context_token")?; if !valid_context(&token) { return fail("invalid_context"); }
-                            s.binding.context_token = token; s.binding.target_app = string(&v,"target_app")?;
+                            let app = string(&v,"target_app")?; if app.len() > 256 { return fail("invalid_binding"); }
+                            s.binding.context_token = token; s.binding.target_app = app;
                             core.send(&s.binding.source_device_id,Payload::SessionBound {binding:s.binding.clone()})?; core.snapshot(s);
                         }
                         "ready" | "listening" => {
@@ -450,7 +476,10 @@ impl Engine {
                         }
                         "apple_result" => {
                             if !source || s.binding.input_mode != Mode::AppleLocal || !s.phase.accepts_text() || s.cancelled || s.stopped { return fail("stale_input_callback"); }
-                            let ready = s.stable.observe(number(&v,"start")? as i64,number(&v,"end")? as i64,number(&v,"finalized_until")? as i64,string(&v,"text")?)?;
+                            let start = i64::try_from(number(&v,"start")?).map_err(|_| err("invalid_audio_range"))?;
+                            let end = i64::try_from(number(&v,"end")?).map_err(|_| err("invalid_audio_range"))?;
+                            let boundary = i64::try_from(number(&v,"finalized_until")?).map_err(|_| err("invalid_audio_range"))?;
+                            let ready = s.stable.observe(start,end,boundary,string(&v,"text")?)?;
                             s.draft = s.stable.draft(); for text in ready { core.freeze(s,text,false)?; } core.snapshot(s);
                         }
                         "source_stopped" => {
@@ -464,17 +493,18 @@ impl Engine {
                             let _ = core.send(&s.other(&core.id),Payload::SessionState {session_id:id,phase:s.phase}); core.snapshot(s);
                         }
                         "source_failed" => {
+                            let code = string(&v,"code")?;
+                            if code.len() > 64 || !code.bytes().all(|c| c.is_ascii_lowercase() || c == b'_') { return fail("invalid_error_code"); }
                             if source { core.request_stop(s); } else { core.pause_receiver(s)?; }
-                            s.phase = Phase::Paused; s.held = false; core.emit(json!({"event":"error","session_id":id,"code":string(&v,"code")?}));
+                            s.phase = Phase::Paused; s.held = false; core.emit(json!({"event":"error","session_id":id,"code":code}));
                             let _ = core.send(&s.other(&core.id),Payload::SessionPause {session_id:id}); core.snapshot(s);
-                        }
-                        "confirm_stopped" => {
-                            if !source { return fail("invalid_role"); } s.stopped = true; s.finalizing = None;
-                            s.phase = if s.cancelled {Phase::Cancelled} else {Phase::AwaitingConfirmation}; core.snapshot(s);
                         }
                         "confirm" => {
                             if !source || s.cancelled || s.frozen || !s.stopped || s.has_unknown() || !matches!(s.phase,Phase::AwaitingConfirmation|Phase::Paused) { return fail("unsafe_confirmation"); }
                             let text = string(&v,"text")?; if !text.is_empty() { validate_text(&text)?; }
+                            // An explicit confirmation must synchronize the target before text.
+                            // A locally invalidated target stays Paused and will still reject it.
+                            core.send(&s.binding.target_device_id,Payload::SessionState {session_id:id,phase:Phase::Committing})?;
                             s.frozen = true; s.phase = Phase::Committing; s.draft.clear();
                             if !text.is_empty() { core.freeze(s,text,true)?; }
                             if s.phase != Phase::Paused { core.end_source(s)?; }
@@ -501,7 +531,8 @@ impl Engine {
                         "resume" => {
                             if source || s.cancelled || s.has_unknown() || s.inflight.is_some() { return fail("unsafe_resume"); }
                             let token = string(&v,"context_token")?; if !valid_context(&token) || token == s.binding.context_token { return fail("invalid_context"); }
-                            s.binding.context_token = token.clone(); s.binding.target_app = string(&v,"target_app")?;
+                            let app = string(&v,"target_app")?; if app.len() > 256 { return fail("invalid_binding"); }
+                            s.binding.context_token = token.clone(); s.binding.target_app = app;
                             s.retry_allowed = s.chunks.iter().filter(|(_,c)| c.status == Ack::NotApplied).map(|(&n,_)| n).collect();
                             s.phase = Phase::Committing;
                             core.send(&s.binding.source_device_id,Payload::SessionResume {session_id:id,context_token:token,target_app:s.binding.target_app.clone()})?; core.snapshot(s);
